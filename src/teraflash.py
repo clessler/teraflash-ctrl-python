@@ -20,6 +20,17 @@ from interface import TopticaSocket
 import interface
 from pulse_detection import detect_pulse
 
+# bounds for the various Event.wait() calls below - chosen generously relative
+# to the device's ~0.25s command/heartbeat cadence, but bounded: a hung
+# connection thread should never be able to wedge the calling thread forever
+CMD_ACK_TIMEOUT = 5.0
+BUFFER_EMPTY_TIMEOUT = 5.0
+CONNECT_TIMEOUT = 30.0
+
+
+class TeraFlashCommandTimeout(RuntimeError):
+    """Raised when the device does not acknowledge a command in time."""
+
 
 class TeraFlash:
 
@@ -87,20 +98,43 @@ class TeraFlash:
                                         self.range_changed, self.acq_running, self.avg_data)
         except ConnectionError:
             logging.error("[INIT] Device is not connected. Check cabling")
-            exit()
+            raise
+
+        # exceptions raised inside a background thread normally vanish into
+        # threading's default excepthook - capture the first one here so a
+        # failed bind()/accept() makes __init__ raise instead of hanging
+        # forever in connected.wait() below
+        self.connect_error = None
+
+        def _run_guarded(target, *args):
+            try:
+                target(*args)
+            except Exception as e:
+                logging.error(f"[INIT] background thread failed: {e!r}")
+                self.connect_error = e
+                self.connected.set()
 
         # configure tcp config socket
-        self.config_thread = threading.Thread(target=self.socket.run_conf_tcp, args=(self.cmd_queue,))
+        self.config_thread = threading.Thread(target=_run_guarded, args=(self.socket.run_conf_tcp, self.cmd_queue))
 
         # configure tcp data socket
-        self.data_thread = threading.Thread(target=self.socket.run_tcp_dat, args=(self.cmd_queue, self.config_queue))
+        self.data_thread = threading.Thread(
+            target=_run_guarded, args=(self.socket.run_tcp_dat, self.cmd_queue, self.config_queue))
 
         # launch threads
         self.data_thread.start()
         self.config_thread.start()
 
-        # wait until a device is connected
-        self.connected.wait()
+        # wait until a device is connected, but not forever
+        if not self.connected.wait(timeout=CONNECT_TIMEOUT):
+            self.running.clear()
+            raise TimeoutError(
+                f"device did not connect within {CONNECT_TIMEOUT}s "
+                f"(config_thread alive={self.config_thread.is_alive()}, "
+                f"data_thread alive={self.data_thread.is_alive()})")
+        if self.connect_error is not None:
+            self.running.clear()
+            raise RuntimeError(f"TCP listener thread failed to start: {self.connect_error!r}") from self.connect_error
 
         # start setup sequence
         self.setup()
@@ -133,6 +167,18 @@ class TeraFlash:
             self.data_thread.join()
             self.config_thread.join()
         logging.debug("[EXIT] disconnected from device")
+
+    def _wait_for_ack(self, timeout: float = CMD_ACK_TIMEOUT) -> None:
+        if not self.cmd_ack.wait(timeout=timeout):
+            logging.error(f"[CMD] device did not acknowledge command within {timeout}s")
+            raise TeraFlashCommandTimeout(f"no cmd_ack within {timeout}s")
+        self.cmd_ack.clear()
+
+    def _wait_for_buffer_emptied(self, timeout: float = BUFFER_EMPTY_TIMEOUT) -> None:
+        if not self.buffer_emptied.wait(timeout=timeout):
+            logging.error(f"[CMD] buffer was not emptied within {timeout}s")
+            raise TeraFlashCommandTimeout(f"buffer not emptied within {timeout}s")
+        self.buffer_emptied.clear()
 
     @staticmethod
     def reset_tcp_avg():
@@ -206,8 +252,7 @@ class TeraFlash:
         logging.debug("[CMD] requesting status")
         cmd = (b'\x14', "SYSTEM : TELL STATUS")
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
 
     def extract_tia_sens(self, text: str) -> list[float]:
         """
@@ -234,8 +279,7 @@ class TeraFlash:
         """
         cmd = (b'\x12', "SYSTEM : MONITOR 1")
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
 
     def set_channel(self, channel: str = "D"):
         """
@@ -246,8 +290,7 @@ class TeraFlash:
         logging.debug(f"[CMD] setting channel: {channel}")
         cmd = (b'\x0b', f"CHANNEL : {channel}")
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
 
     def set_mode(self, motion: str = "NORMAL"):
         """
@@ -258,8 +301,7 @@ class TeraFlash:
         logging.debug(f"[CMD] setting motion: {motion}")
         cmd = (b'\x0f', f"MOTION : {motion}")
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
 
     def set_transmission(self, transmission: str = "SLIDING"):
         """
@@ -270,8 +312,7 @@ class TeraFlash:
         logging.debug(f"[CMD] setting transmission: {transmission}")
         cmd = (b'\x16', f"TRANSMISSION : {transmission}")
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
 
     def set_antenna_range(self, antenna_range: float):
         """
@@ -294,8 +335,7 @@ class TeraFlash:
         cmd = (b'\x11', f"SYSTEM : TIA {string}")
 
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
 
     def set_antenna_range_index(self, i):
         """
@@ -314,8 +354,7 @@ class TeraFlash:
         cmd = (b'\x11', f"SYSTEM : TIA {string}")
 
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
 
     def set_acq_begin(self, t_begin: float = 1000.0):
         """
@@ -340,14 +379,12 @@ class TeraFlash:
         logging.debug(f"stopped acq")
         self.cmd_queue.put(cmd)
         logging.debug(f"put cmd")
-        self.cmd_ack.wait()
         logging.debug(f"wait for cmd ack")
-        self.cmd_ack.clear()
+        self._wait_for_ack()
         logging.debug(f"set t_begin")
         self.t_begin = t_begin
         logging.debug(f"waiting for buffer to be emptied")
-        self.buffer_emptied.wait()
-        self.buffer_emptied.clear()
+        self._wait_for_buffer_emptied()
         logging.debug(f"buffer is emptied")
         if measurement_was_running:
             # if the measurement was running, restart it
@@ -395,11 +432,9 @@ class TeraFlash:
         self.range_changed.set()
         self.set_acq_stop()
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
         self.range = t_range
-        self.buffer_emptied.wait()
-        self.buffer_emptied.clear()
+        self._wait_for_buffer_emptied()
         if measurement_was_running:
             # if the measurement was running, restart it
             self.set_acq_start()
@@ -421,8 +456,7 @@ class TeraFlash:
             b = b'\x1a'
         cmd = (b, f"ACQUISITION : AVERAGE {avg}")
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
         # reset the average after it was changed
         self.reset_acq_avg()
         self.avg = avg
@@ -436,8 +470,7 @@ class TeraFlash:
 
         cmd = (b'\x17', "ACQUISITION : RESET AVG")
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
         self.socket.avg_countdown = self.avg
 
     def wait_for_avg(self):
@@ -461,8 +494,7 @@ class TeraFlash:
             logging.debug("[CMD] setting laser off")
             cmd = (b'\x0b', "LASER : OFF")
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
         self.laser = state
 
     def set_emitter(self, emitter: int, state: bool):
@@ -485,8 +517,7 @@ class TeraFlash:
             logging.debug(f"[CMD] setting emitter {emitter} off")
             cmd = (b'\x0b', f"VOLT{emitter} : OFF")
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
         self.emitter[emitter - 1] = state
 
     def set_acq_start(self):
@@ -496,8 +527,7 @@ class TeraFlash:
         logging.debug("[CMD] starting acquisition")
         cmd = (b'\x13', "ACQUISITION : START")
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
         self.acq_running.set()
         self.acquisition = True
 
@@ -508,8 +538,7 @@ class TeraFlash:
         logging.debug("[CMD] stopping acquisition")
         cmd = (b'\x12', "ACQUISITION : STOP")
         self.cmd_queue.put(cmd)
-        self.cmd_ack.wait()
-        self.cmd_ack.clear()
+        self._wait_for_ack()
         self.acq_running.clear()
         self.acquisition = False
 

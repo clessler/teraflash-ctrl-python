@@ -123,7 +123,12 @@ class TopticaSocket:
 
         """
         while self.running.is_set():
-            _data = client.recv(length)[self.read_header_len:]
+            try:
+                _data = client.recv(length)[self.read_header_len:]
+            except socket.timeout:
+                # no reply yet - loop back so `running` gets re-checked instead
+                # of blocking on recv() forever if the device stops responding
+                continue
             if _data:
                 _data_decoded = _data.decode("utf-8", "ignore")
                 if "OK" in _data_decoded:
@@ -158,55 +163,75 @@ class TopticaSocket:
             s.listen()
             # accept connection from device
             client, addr = s.accept()
+            # bounded recv/send so a silent device can never wedge this thread
+            # forever - matches run_tcp_dat's existing pattern
+            client.settimeout(2)
             logging.info(f"[TCP CONF] Connected by client with address {addr}")
             # now we are connected
             self.connected.set()
 
-            while self.running.is_set():
-                # check the queue for commands
+            try:
+                while self.running.is_set():
+                    try:
+                        # check the queue for commands
+                        try:
+                            cmd = cmd_queue.get(block=False)
+                            logging.debug(f"[TCP CONF] sending: {cmd}")
+                            (b, c) = cmd
+                            message = self.send_header + b + c.encode()
+                            # send command
+                            client.send(message)
+                            if b == b'\x14':
+                                # if we request the status, save the response
+                                status = client.recv(2048)[self.read_header_len:].decode("utf-8", "ignore")
+                                self.cmd_ack.set()
+                            elif "RANGE" in c:
+                                # if we change the range, also change it for the data thread
+                                parts = c.split(" ")
+                                self.range = float(parts[-1])
+                                data.time = np.linspace(self.t_begin, self.t_begin + self.range, 20 * int(self.range) + 1)
+                                # wait for acknowledge
+                                if not self.wait_for_answer(client):
+                                    return
+                                self.cmd_ack.set()
+                            elif "BEGIN" in c:
+                                # if we change the range, also change it for the data thread
+                                parts = c.split(" ")
+                                self.t_begin = float(parts[-1])
+                                data.time = np.linspace(self.t_begin, self.t_begin + self.range, 20 * int(self.range) + 1)
+                                # wait for acknowledge
+                                if not self.wait_for_answer(client):
+                                    return
+                                self.cmd_ack.set()
+                            else:
+                                # wait for acknowledge
+                                if not self.wait_for_answer(client):
+                                    return
+                                self.cmd_ack.set()
+                        except Empty:
+                            # just to a simple heartbeat
+                            (b, c) = (b'\x12', "SYSTEM : MONITOR 1")
+                            message = self.send_header + b + c.encode()
+                            client.send(message)
+                            # wait for acknowledge
+                            if not self.wait_for_answer(client):
+                                return
+                    except socket.timeout:
+                        # device didn't respond to this cycle's recv/send within
+                        # the socket timeout - loop back so `running` gets
+                        # re-checked instead of this thread hanging forever
+                        logging.debug("[TCP CONF] recv/send timed out this cycle, retrying")
+                        continue
+                    time.sleep(0.25)
+            finally:
+                # always release the device-facing socket, even on early return
+                # or an escaping exception - otherwise the listening socket's
+                # `with` block can't close either, and the port stays bound
                 try:
-                    cmd = cmd_queue.get(block=False)
-                    logging.debug(f"[TCP CONF] sending: {cmd}")
-                    (b, c) = cmd
-                    message = self.send_header + b + c.encode()
-                    # send command
-                    client.send(message)
-                    if b == b'\x14':
-                        # if we request the status, save the response
-                        status = client.recv(2048)[self.read_header_len:].decode("utf-8", "ignore")
-                        self.cmd_ack.set()
-                    elif "RANGE" in c:
-                        # if we change the range, also change it for the data thread
-                        parts = c.split(" ")
-                        self.range = float(parts[-1])
-                        data.time = np.linspace(self.t_begin, self.t_begin + self.range, 20 * int(self.range) + 1)
-                        # wait for acknowledge
-                        if not self.wait_for_answer(client):
-                            return
-                        self.cmd_ack.set()
-                    elif "BEGIN" in c:
-                        # if we change the range, also change it for the data thread
-                        parts = c.split(" ")
-                        self.t_begin = float(parts[-1])
-                        data.time = np.linspace(self.t_begin, self.t_begin + self.range, 20 * int(self.range) + 1)
-                        # wait for acknowledge
-                        if not self.wait_for_answer(client):
-                            return
-                        self.cmd_ack.set()
-                    else:
-                        # wait for acknowledge
-                        if not self.wait_for_answer(client):
-                            return
-                        self.cmd_ack.set()
-                except Empty:
-                    # just to a simple heartbeat
-                    (b, c) = (b'\x12', "SYSTEM : MONITOR 1")
-                    message = self.send_header + b + c.encode()
-                    client.send(message)
-                    # wait for acknowledge
-                    if not self.wait_for_answer(client):
-                        return
-                time.sleep(0.25)
+                    client.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                client.close()
 
     def run_tcp_dat(self, cmd_queue: Queue, config_queue: Queue):
         """
@@ -235,122 +260,132 @@ class TopticaSocket:
 
             logging.info(f"[TCP DAT] Connected by client with address {addr}")
             # now we are connected
-            while self.running.is_set():
-                if self.range_changed.is_set():
-                    # range has changed and needs to be adjusted
-                    # need to empty the read buffer
-                    while self.running.is_set():
-                        logging.debug(f"emptying buffer...")
-                        try:
-                            client.recv(32100)
-                        except socket.timeout:
-                            break
-                    self.buffer_emptied.set()
-                    self.range_changed.clear()
-
-                # data always comes in the shape of 4 datasets each as 16bit ints with length of
-                # (20 * self.range + 1)
-                # the header is 52 8 bit ints and since we read 8 bit ints we need to multiply the data by 2
-                if self.range_changed.is_set():
-                    continue
-                if not self.acq_running.is_set():
-                    # no data received
-                    time.sleep(1.0)
-                    continue
-                try:
-                    raw_data = client.recv(2 * 4 * (20 * int(self.range) + 1) + self.full_data_header_len)
-                except socket.timeout:
-                    continue
-                if not raw_data:
-                    # no data received
-                    time.sleep(1.0)
-                    continue
-
-                if raw_data[:self.data_header_len] != self.r_dat_header:
-                    continue
-
-                if len(raw_data) != 2 * 4 * (20 * int(self.range) + 1) + self.full_data_header_len:
-                    skip_this = False
-                    while self.running.is_set():
-                        try:
-                            to_append = client.recv(
-                                2 * 4 * (20 * int(self.range) + 1) + self.full_data_header_len - len(raw_data))
-                            raw_data += to_append
-                            if len(raw_data) == 2 * 4 * (20 * int(self.range) + 1) + self.full_data_header_len:
+            try:
+                while self.running.is_set():
+                    if self.range_changed.is_set():
+                        # range has changed and needs to be adjusted
+                        # need to empty the read buffer
+                        while self.running.is_set():
+                            logging.debug(f"emptying buffer...")
+                            try:
+                                client.recv(32100)
+                            except socket.timeout:
                                 break
-                            if len(raw_data) == 2 * 4 * (20 * int(self.range) + 1) + self.full_data_header_len:
-                                skip_this = True
-                                break
-                        except socket.timeout:
-                            skip_this = True
-                            break
-                    if skip_this:
+                        self.buffer_emptied.set()
+                        self.range_changed.clear()
+
+                    # data always comes in the shape of 4 datasets each as 16bit ints with length of
+                    # (20 * self.range + 1)
+                    # the header is 52 8 bit ints and since we read 8 bit ints we need to multiply the data by 2
+                    if self.range_changed.is_set():
+                        continue
+                    if not self.acq_running.is_set():
+                        # no data received
+                        time.sleep(1.0)
+                        continue
+                    try:
+                        raw_data = client.recv(2 * 4 * (20 * int(self.range) + 1) + self.full_data_header_len)
+                    except socket.timeout:
+                        continue
+                    if not raw_data:
+                        # no data received
+                        time.sleep(1.0)
                         continue
 
-                # TODO: the following code is not properly implemented yet, we need
-                # to check how we handle it, if the data comes not in the proper packet length
+                    if raw_data[:self.data_header_len] != self.r_dat_header:
+                        continue
 
-                _data = raw_data[self.full_data_header_len:]
+                    if len(raw_data) != 2 * 4 * (20 * int(self.range) + 1) + self.full_data_header_len:
+                        skip_this = False
+                        while self.running.is_set():
+                            try:
+                                to_append = client.recv(
+                                    2 * 4 * (20 * int(self.range) + 1) + self.full_data_header_len - len(raw_data))
+                                raw_data += to_append
+                                if len(raw_data) == 2 * 4 * (20 * int(self.range) + 1) + self.full_data_header_len:
+                                    break
+                                if len(raw_data) == 2 * 4 * (20 * int(self.range) + 1) + self.full_data_header_len:
+                                    skip_this = True
+                                    break
+                            except socket.timeout:
+                                skip_this = True
+                                break
+                        if skip_this:
+                            continue
 
-                # check if header is at the beginning of the received payload
-                # if raw_data[:self.data_header_len] == self.r_dat_header:
-                #     # remove the header
-                #     _data = raw_data[self.data_header_len:]
-                # else:
-                #     _data = raw_data[self.data_header_len:]
-                #     # print("header not in the beginning")
-                #     while self.running.is_set():
-                #         logging.info("data does not have correct length...")
-                #
-                #         # check if the data is of the correct length
-                #         if len(_data) != 2 * 4 * (20 * self.range + 1):
-                #             _data = _data + client.recv(2 * 4 * (20 * int(self.range) + 1) - len(_data))
-                #         else:
-                #             break
-                try:
-                    # decode received payload to 32 bit ints
-                    types = types.newbyteorder('>')
-                    arr = np.frombuffer(_data, dtype=types)
+                    # TODO: the following code is not properly implemented yet, we need
+                    # to check how we handle it, if the data comes not in the proper packet length
 
-                    if not config_queue.empty():
-                        antenna_range = config_queue.get()
+                    _data = raw_data[self.full_data_header_len:]
 
-                    scale_factor = 20.0 * 1000.0 / antenna_range;
+                    # check if header is at the beginning of the received payload
+                    # if raw_data[:self.data_header_len] == self.r_dat_header:
+                    #     # remove the header
+                    #     _data = raw_data[self.data_header_len:]
+                    # else:
+                    #     _data = raw_data[self.data_header_len:]
+                    #     # print("header not in the beginning")
+                    #     while self.running.is_set():
+                    #         logging.info("data does not have correct length...")
+                    #
+                    #         # check if the data is of the correct length
+                    #         if len(_data) != 2 * 4 * (20 * self.range + 1):
+                    #             _data = _data + client.recv(2 * 4 * (20 * int(self.range) + 1) - len(_data))
+                    #         else:
+                    #             break
+                    try:
+                        # decode received payload to 32 bit ints
+                        types = types.newbyteorder('>')
+                        arr = np.frombuffer(_data, dtype=types)
 
-                    # TODO: make subtracting offset optional.
-                    signal_1 = arr['signal_1'] / scale_factor / 2 ** 16 - arr['signal_1'][0] / scale_factor / 2 ** 16
-                    signal_2 = arr['signal_2'] / scale_factor / 2 ** 16 - arr['signal_2'][0] / scale_factor / 2 ** 16
+                        if not config_queue.empty():
+                            antenna_range = config_queue.get()
 
-                    if self.avg_data.is_set():
-                        if data.signal_1.shape == signal_1.shape:
-                            data.signal_1 += signal_1
+                        scale_factor = 20.0 * 1000.0 / antenna_range;
+
+                        # TODO: make subtracting offset optional.
+                        signal_1 = arr['signal_1'] / scale_factor / 2 ** 16 - arr['signal_1'][0] / scale_factor / 2 ** 16
+                        signal_2 = arr['signal_2'] / scale_factor / 2 ** 16 - arr['signal_2'][0] / scale_factor / 2 ** 16
+
+                        if self.avg_data.is_set():
+                            if data.signal_1.shape == signal_1.shape:
+                                data.signal_1 += signal_1
+                            else:
+                                data.signal_1 = signal_1
+                            if data.signal_2.shape == signal_2.shape:
+                                data.signal_2 += signal_2
+                            n_avg += 1
                         else:
                             data.signal_1 = signal_1
-                        if data.signal_2.shape == signal_2.shape:
-                            data.signal_2 += signal_2
-                        n_avg += 1
-                    else:
-                        data.signal_1 = signal_1
-                        data.signal_2 = signal_2
-                        n_avg = 0
+                            data.signal_2 = signal_2
+                            n_avg = 0
 
-                    # do fft of signal 1
-                    pulse = data.signal_1
-                    f, a, arg = get_fft(data.time, pulse)
-                    data.freq = f
-                    data.fft_1_amp = a / np.max(a)
-                    data.fft_1_phase = arg
+                        # do fft of signal 1
+                        pulse = data.signal_1
+                        f, a, arg = get_fft(data.time, pulse)
+                        data.freq = f
+                        data.fft_1_amp = a / np.max(a)
+                        data.fft_1_phase = arg
 
-                    # do fft of signal 2
-                    pulse = data.signal_2
-                    f, a, arg = get_fft(data.time, pulse)
-                    data.fft_2_amp = a / np.max(a)
-                    data.fft_2_phase = arg
+                        # do fft of signal 2
+                        pulse = data.signal_2
+                        f, a, arg = get_fft(data.time, pulse)
+                        data.fft_2_amp = a / np.max(a)
+                        data.fft_2_phase = arg
 
-                    # update avg countdown
-                    if self.avg_countdown > 0:
-                        self.avg_countdown -= 1
+                        # update avg countdown
+                        if self.avg_countdown > 0:
+                            self.avg_countdown -= 1
 
-                except Exception as e:
-                    logging.error(e)
-                    logging.error(f"{len(data.signal_1)=}")
+                    except Exception as e:
+                        logging.error(e)
+                        logging.error(f"{len(data.signal_1)=}")
+            finally:
+                # always release the device-facing socket, even on early return
+                # or an escaping exception - otherwise the listening socket's
+                # `with` block can't close either, and the port stays bound
+                try:
+                    client.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                client.close()
