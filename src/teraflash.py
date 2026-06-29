@@ -40,7 +40,8 @@ class TeraFlash:
                  t_begin: float = 1000.0,
                  antenna_range: float = 1000.0,
                  avg: int = 2,
-                 log_file=None):
+                 log_file=None,
+                 leave_laser_on_at_exit: bool = False):
         """
             TeraFlash object used to handle all top level interactions with the user
         Args:
@@ -49,6 +50,19 @@ class TeraFlash:
             t_begin: initial start time of the window in ps
             avg: initial number of measurements to average
             log_file: name of the logfile, if required
+            leave_laser_on_at_exit: if True, disconnecting (including via the
+                `with TeraFlash(...) as device:` context manager) does NOT turn
+                the laser or emitter bias off - both stay running in hardware so
+                a later script/connection can reuse the device without the ~1
+                day warmup. Default (False) matches the previous behavior: full
+                shutdown on disconnect. Acquisition/voice-coil scanning is
+                always stopped on disconnect regardless of this flag, since
+                only the laser itself has a warmup benefit from staying on.
+
+                SAFETY: once a script may leave the laser on after it exits, do
+                NOT assume "laser is off because no script is running." Always
+                check the physical front-panel "Laser Emission" warning LEDs
+                before disconnecting/connecting fibers, per the manual.
         """
         self.r_dat_header = b'\xcd\xef\x124x\x9a\xfe\xdc\x00\x00\x00\x01\x00\xff\x91\xe7\x03\xe8\x00\x00'
         self.send_header = b'\xcd\xef\x124x\x9a\xfe\xdc\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00'
@@ -68,6 +82,7 @@ class TeraFlash:
         self.laser = False
         self.emitter = [False, False]
         self.acquisition = False
+        self._leave_laser_on_at_exit = leave_laser_on_at_exit
         self.allowed_antenna_ranges = [str(antenna_range)]
         self.antenna_range = antenna_range
         self.range = rng
@@ -159,7 +174,7 @@ class TeraFlash:
             traceback: -
         """
         # disconnect routine
-        self.disconnect()
+        self.disconnect(leave_laser_on=self._leave_laser_on_at_exit)
         time.sleep(1)
         self.running.clear()
         # if a device was connected, wait for the TCP threads to finish
@@ -235,12 +250,23 @@ class TeraFlash:
         self.range_changed.clear()
         logging.info("[INIT] device is ready.")
 
-    def disconnect(self):
+    def disconnect(self, leave_laser_on: bool = False):
         """
             disconnects from the device, order of calls is important!
+        Args:
+            leave_laser_on: if True, skip turning off the emitter bias and the
+                laser - both stay running in hardware so a later connection
+                can reuse them without the ~1 day warmup. Acquisition/voice-coil
+                scanning is still stopped either way.
         """
         logging.debug("[CMD] disconnecting from device")
         self.set_acq_stop()
+        if leave_laser_on:
+            logging.warning(
+                "[CMD] leaving laser and emitter bias ON at disconnect - verify "
+                "the physical 'Laser Emission' warning LEDs before handling "
+                "fibers/antennas")
+            return
         self.set_emitter(1, False)
         self.set_emitter(2, False)
         self.set_laser(False)
