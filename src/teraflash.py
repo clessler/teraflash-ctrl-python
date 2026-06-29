@@ -26,10 +26,10 @@ from pulse_detection import detect_pulse
 CMD_ACK_TIMEOUT = 5.0
 BUFFER_EMPTY_TIMEOUT = 5.0
 CONNECT_TIMEOUT = 30.0
-# set_acq_begin/set_acq_range physically reposition a motor-driven delay
-# stage (unlike the simple on/off-style commands), so a large position
-# change can legitimately take much longer to ack than CMD_ACK_TIMEOUT.
-STAGE_MOVE_TIMEOUT = 30.0
+# ACQUISITION : BEGIN/RANGE/START/STOP all interact with the motor-driven
+# delay stage (repositioning it, or starting/stopping its continuous scan),
+# so any of them can legitimately take much longer to ack than CMD_ACK_TIMEOUT.
+ACQ_TIMEOUT = 30.0
 
 
 class TeraFlashCommandTimeout(RuntimeError):
@@ -399,11 +399,11 @@ class TeraFlash:
         self.cmd_queue.put(cmd)
         logging.debug(f"put cmd")
         logging.debug(f"wait for cmd ack")
-        self._wait_for_ack(timeout=STAGE_MOVE_TIMEOUT)
+        self._wait_for_ack(timeout=ACQ_TIMEOUT)
         logging.debug(f"set t_begin")
         self.t_begin = t_begin
         logging.debug(f"waiting for buffer to be emptied")
-        self._wait_for_buffer_emptied(timeout=STAGE_MOVE_TIMEOUT)
+        self._wait_for_buffer_emptied(timeout=ACQ_TIMEOUT)
         logging.debug(f"buffer is emptied")
         if measurement_was_running:
             # if the measurement was running, restart it
@@ -451,9 +451,9 @@ class TeraFlash:
         self.range_changed.set()
         self.set_acq_stop()
         self.cmd_queue.put(cmd)
-        self._wait_for_ack(timeout=STAGE_MOVE_TIMEOUT)
+        self._wait_for_ack(timeout=ACQ_TIMEOUT)
         self.range = t_range
-        self._wait_for_buffer_emptied(timeout=STAGE_MOVE_TIMEOUT)
+        self._wait_for_buffer_emptied(timeout=ACQ_TIMEOUT)
         if measurement_was_running:
             # if the measurement was running, restart it
             self.set_acq_start()
@@ -546,7 +546,7 @@ class TeraFlash:
         logging.debug("[CMD] starting acquisition")
         cmd = (b'\x13', "ACQUISITION : START")
         self.cmd_queue.put(cmd)
-        self._wait_for_ack()
+        self._wait_for_ack(timeout=ACQ_TIMEOUT)
         self.acq_running.set()
         self.acquisition = True
 
@@ -557,7 +557,7 @@ class TeraFlash:
         logging.debug("[CMD] stopping acquisition")
         cmd = (b'\x12', "ACQUISITION : STOP")
         self.cmd_queue.put(cmd)
-        self._wait_for_ack()
+        self._wait_for_ack(timeout=ACQ_TIMEOUT)
         self.acq_running.clear()
         self.acquisition = False
 
