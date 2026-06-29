@@ -26,6 +26,10 @@ from pulse_detection import detect_pulse
 CMD_ACK_TIMEOUT = 5.0
 BUFFER_EMPTY_TIMEOUT = 5.0
 CONNECT_TIMEOUT = 30.0
+# set_acq_begin/set_acq_range physically reposition a motor-driven delay
+# stage (unlike the simple on/off-style commands), so a large position
+# change can legitimately take much longer to ack than CMD_ACK_TIMEOUT.
+STAGE_MOVE_TIMEOUT = 30.0
 
 
 class TeraFlashCommandTimeout(RuntimeError):
@@ -167,21 +171,36 @@ class TeraFlash:
 
     def __exit__(self, tp, value, traceback):
         """
-            Exit point of the context manager, closes the TCP connection properly
+            Exit point of the context manager, closes the TCP connection
+            properly. If the with-block exited because of an error (e.g. a
+            command was not acknowledged in time), the device's state can no
+            longer be trusted - this forces a full, real disconnect (laser +
+            emitter OFF) regardless of leave_laser_on_at_exit. "Leave it
+            warm" is only honored on a clean exit.
         Args:
-            tp: -
-            value: -
+            tp: exception type the with-block raised, or None on a clean exit
+            value: exception value, or None
             traceback: -
         """
-        # disconnect routine
-        self.disconnect(leave_laser_on=self._leave_laser_on_at_exit)
-        time.sleep(1)
-        self.running.clear()
-        # if a device was connected, wait for the TCP threads to finish
-        if self.connected.is_set():
-            self.data_thread.join()
-            self.config_thread.join()
-        logging.debug("[EXIT] disconnected from device")
+        leave_laser_on = self._leave_laser_on_at_exit and tp is None
+        if tp is not None:
+            logging.error(
+                f"[EXIT] exiting because of {tp.__name__}: {value} - forcing "
+                "a full disconnect (laser + emitter OFF) regardless of "
+                "leave_laser_on_at_exit, since the device's state can no "
+                "longer be trusted")
+        try:
+            self.disconnect(leave_laser_on=leave_laser_on)
+        finally:
+            # always stop the TCP threads, even if disconnect() itself timed
+            # out - otherwise the process hangs until killed
+            time.sleep(1)
+            self.running.clear()
+            # if a device was connected, wait for the TCP threads to finish
+            if self.connected.is_set():
+                self.data_thread.join()
+                self.config_thread.join()
+            logging.debug("[EXIT] disconnected from device")
 
     def _wait_for_ack(self, timeout: float = CMD_ACK_TIMEOUT) -> None:
         if not self.cmd_ack.wait(timeout=timeout):
@@ -406,11 +425,11 @@ class TeraFlash:
         self.cmd_queue.put(cmd)
         logging.debug(f"put cmd")
         logging.debug(f"wait for cmd ack")
-        self._wait_for_ack()
+        self._wait_for_ack(timeout=STAGE_MOVE_TIMEOUT)
         logging.debug(f"set t_begin")
         self.t_begin = t_begin
         logging.debug(f"waiting for buffer to be emptied")
-        self._wait_for_buffer_emptied()
+        self._wait_for_buffer_emptied(timeout=STAGE_MOVE_TIMEOUT)
         logging.debug(f"buffer is emptied")
         if measurement_was_running:
             # if the measurement was running, restart it
@@ -458,9 +477,9 @@ class TeraFlash:
         self.range_changed.set()
         self.set_acq_stop()
         self.cmd_queue.put(cmd)
-        self._wait_for_ack()
+        self._wait_for_ack(timeout=STAGE_MOVE_TIMEOUT)
         self.range = t_range
-        self._wait_for_buffer_emptied()
+        self._wait_for_buffer_emptied(timeout=STAGE_MOVE_TIMEOUT)
         if measurement_was_running:
             # if the measurement was running, restart it
             self.set_acq_start()
