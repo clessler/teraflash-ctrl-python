@@ -112,6 +112,35 @@ class TopticaSocket:
             res = True
         return res
 
+    def _frame_command(self, cmd, log: bool = True):
+        """
+            builds the bytes sent for a command: send_header + length byte + ASCII command
+        Args:
+            cmd: (legacy length byte, command string) tuple as queued by teraflash.py
+            log: log the sent command (off for the heartbeat, which runs every 0.25 s)
+
+        Returns: the message bytes, or None if the command cannot be framed
+
+        """
+        (b, c) = cmd
+        payload = c.encode()
+        # the byte after the header is the command length: it equals len(command) for
+        # every command that has been acked. compute it here instead of trusting the
+        # per-command tables, which were wrong for e.g. "ACQUISITION : BEGIN 500.0"
+        # (declared 26, sent 25), "TRANSMISSION : BLOCK" and "ACQUISITION : AVERAGE 10000"
+        if not 1 <= len(payload) <= 255:
+            # never raise here: an exception would end this thread and drop the
+            # connection (which turns the laser off). the caller times out instead.
+            logging.error(f"[TCP CONF] cannot frame command of length {len(payload)}: {c!r}")
+            return None
+        length_byte = bytes([len(payload)])
+        if b != length_byte:
+            logging.warning(f"[TCP CONF] corrected length byte for {c!r}: "
+                            f"legacy {b!r}, sending {length_byte!r}")
+        if log:
+            logging.debug(f"[TCP CONF] sending: {(length_byte, c)}")
+        return self.send_header + length_byte + payload
+
     def wait_for_answer(self, client: socket, length: int = 1024):
         """
             waits for the device to acknowledge the previously sent command
@@ -176,12 +205,13 @@ class TopticaSocket:
                         # check the queue for commands
                         try:
                             cmd = cmd_queue.get(block=False)
-                            logging.debug(f"[TCP CONF] sending: {cmd}")
                             (b, c) = cmd
-                            message = self.send_header + b + c.encode()
+                            message = self._frame_command(cmd)
+                            if message is None:
+                                continue
                             # send command
                             client.send(message)
-                            if b == b'\x14':
+                            if c == "SYSTEM : TELL STATUS":
                                 # if we request the status, save the response
                                 status = client.recv(2048)[self.read_header_len:].decode("utf-8", "ignore")
                                 self.cmd_ack.set()
@@ -210,8 +240,7 @@ class TopticaSocket:
                                 self.cmd_ack.set()
                         except Empty:
                             # just to a simple heartbeat
-                            (b, c) = (b'\x12', "SYSTEM : MONITOR 1")
-                            message = self.send_header + b + c.encode()
+                            message = self._frame_command((b'\x12', "SYSTEM : MONITOR 1"), log=False)
                             client.send(message)
                             # wait for acknowledge
                             if not self.wait_for_answer(client):
