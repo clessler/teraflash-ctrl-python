@@ -35,7 +35,7 @@ ACQ_TIMEOUT = 30.0
 # T_BEGIN_MIN: TOPTICA's TF5-Host and the Rust teraflash-ctrl GUI both clamp here;
 # the reason is undocumented (possibly electrical pickup from the pulse - unconfirmed).
 # T_BEGIN_MAX: the stationary delay stage spans 0 - 4000 ps, so no scan may start
-# beyond it. Fiber delays added to the emitter/receiver are invisible to the software.
+# beyond it (4000 ps itself is allowed). Fiber delays added to the emitter/receiver are invisible to the software.
 T_BEGIN_MIN = 90.0
 T_BEGIN_MAX = 4000.0
 
@@ -387,13 +387,13 @@ class TeraFlash:
         """
             sets the start time of the time domain window.
         Args:
-            t_begin: The desired start time, T_BEGIN_MIN <= t_begin < T_BEGIN_MAX
+            t_begin: The desired start time, T_BEGIN_MIN <= t_begin <= T_BEGIN_MAX
         """
         # validate before anything is sent: check the value as it is transmitted (.1f)
         t_sent = float(f"{t_begin:.1f}")
-        if not (math.isfinite(t_sent) and T_BEGIN_MIN <= t_sent < T_BEGIN_MAX):
+        if not (math.isfinite(t_sent) and T_BEGIN_MIN <= t_sent <= T_BEGIN_MAX):
             raise ValueError(f"t_begin = {t_begin} (sent as {t_sent:.1f}) is outside the allowed range "
-                             f"{T_BEGIN_MIN} <= t_begin < {T_BEGIN_MAX} ps")
+                             f"{T_BEGIN_MIN} <= t_begin <= {T_BEGIN_MAX} ps")
         logging.debug(f"[CMD] setting acq begin: {t_begin}")
         if t_begin < 10:
             b = b'\x18'
