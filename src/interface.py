@@ -39,6 +39,57 @@ class DataContainer:
         self.fft_2_amp = np.zeros(n)
         self.fft_2_phase = np.zeros(n)
 
+        # zero-line offsets (nA) subtracted from the latest frame: raw = signal + offset
+        self.offset_1 = 0.0
+        self.offset_2 = 0.0
+        # latest decoded Frame, replaced as a whole so one read is never a mix of two frames
+        self.frame = None
+
+
+class Frame:
+
+    def __init__(self, time, signal_1, signal_2, offset_1, offset_2):
+        """
+            One decoded frame as received, independent of the averaging in DataContainer
+        Args:
+            time: time axis (ps) in use when the frame was decoded
+            signal_1, signal_2: traces (nA) with the zero line subtracted
+            offset_1, offset_2: subtracted zero-line offsets (nA); raw = signal + offset
+        """
+        self.time = time
+        self.signal_1 = signal_1
+        self.signal_2 = signal_2
+        self.offset_1 = offset_1
+        self.offset_2 = offset_2
+
+
+# TF5-Host's "0-line: auto" (manual 5.2.9, the standard setting) zeroes the signal at the
+# beginning of the trace. In all 61 traces saved by TF5-Host in our demo data, the mean of
+# the first 5 samples (0.25 ps) is zero to the file precision (<= 2e-7 nA) while the first
+# sample alone is not (up to 0.11 nA), so we subtract that mean too. Inferred from the
+# files; the exact TF5-Host rule is not documented.
+ZERO_LINE_SAMPLES = 5
+
+
+def decode_frame(payload: bytes, antenna_range: float):
+    """
+        Decodes a data payload (header removed) of big-endian int32 pairs
+    Args:
+        payload: the frame without its 52-byte header
+        antenna_range: TIA range (nA)
+
+    Returns: (signal_1, signal_2, offset_1, offset_2) in nA, with the zero line
+        (mean of the first ZERO_LINE_SAMPLES samples) subtracted from each signal
+    """
+    types = np.dtype([("signal_1", np.int32), ("signal_2", np.int32)]).newbyteorder('>')
+    arr = np.frombuffer(payload, dtype=types)
+    scale_factor = 20.0 * 1000.0 / antenna_range
+    raw_1 = arr['signal_1'] / scale_factor / 2 ** 16
+    raw_2 = arr['signal_2'] / scale_factor / 2 ** 16
+    offset_1 = float(np.mean(raw_1[:ZERO_LINE_SAMPLES]))
+    offset_2 = float(np.mean(raw_2[:ZERO_LINE_SAMPLES]))
+    return raw_1 - offset_1, raw_2 - offset_2, offset_1, offset_2
+
 
 # global variables for thread communication
 data = DataContainer()
@@ -268,10 +319,6 @@ class TopticaSocket:
         """
         global data
         global n_avg
-        types = np.dtype([
-            ("signal_1", np.int32),
-            ("signal_2", np.int32),
-        ])
         antenna_range = 1000.0
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -363,24 +410,21 @@ class TopticaSocket:
                     #         else:
                     #             break
                     try:
-                        # decode received payload to 32 bit ints
-                        types = types.newbyteorder('>')
-                        arr = np.frombuffer(_data, dtype=types)
-
                         if not config_queue.empty():
                             antenna_range = config_queue.get()
 
-                        scale_factor = 20.0 * 1000.0 / antenna_range;
-
-                        # TODO: make subtracting offset optional.
-                        signal_1 = arr['signal_1'] / scale_factor / 2 ** 16 - arr['signal_1'][0] / scale_factor / 2 ** 16
-                        signal_2 = arr['signal_2'] / scale_factor / 2 ** 16 - arr['signal_2'][0] / scale_factor / 2 ** 16
+                        # decode received payload, subtracting the zero line (see ZERO_LINE_SAMPLES)
+                        signal_1, signal_2, offset_1, offset_2 = decode_frame(_data, antenna_range)
+                        data.frame = Frame(data.time, signal_1, signal_2, offset_1, offset_2)
+                        data.offset_1 = offset_1
+                        data.offset_2 = offset_2
 
                         if self.avg_data.is_set():
+                            # copies: the += below must not change the published frame
                             if data.signal_1.shape == signal_1.shape:
                                 data.signal_1 += signal_1
                             else:
-                                data.signal_1 = signal_1
+                                data.signal_1 = signal_1.copy()
                             if data.signal_2.shape == signal_2.shape:
                                 data.signal_2 += signal_2
                             n_avg += 1

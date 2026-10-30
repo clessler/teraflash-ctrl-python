@@ -505,8 +505,27 @@ class TeraFlash:
         self._wait_for_ack()
         self.socket.avg_countdown = self.avg
 
-    def wait_for_avg(self):
+    def wait_for_avg(self, frame_timeout: float = ACQ_TIMEOUT):
+        """
+            blocks until the averaging countdown armed by set_acq_avg() or
+            reset_acq_avg() reaches zero, i.e. until avg new frames have arrived.
+            Returns at once if the countdown was not re-armed since the last wait.
+        Args:
+            frame_timeout: maximum time (s) to wait for the next frame. There is no
+                cap on the total, which grows with avg (~6 frames/s at a 200 ps range).
+        """
+        if self.socket.avg_countdown > 0 and not self.acquisition:
+            raise RuntimeError("wait_for_avg() needs a running acquisition: call set_acq_start() first")
+        remaining = self.socket.avg_countdown
+        deadline = time.monotonic() + frame_timeout
         while self.socket.avg_countdown > 0:
+            if self.socket.avg_countdown != remaining:
+                remaining = self.socket.avg_countdown
+                deadline = time.monotonic() + frame_timeout
+            elif time.monotonic() > deadline:
+                logging.error(f"[CMD] no new frame within {frame_timeout}s, {remaining} of {self.avg} still to come")
+                raise TeraFlashCommandTimeout(f"no new frame within {frame_timeout}s "
+                                              f"({remaining} of {self.avg} still to come)")
             time.sleep(0.1)
 
     def set_laser(self, state: bool):
