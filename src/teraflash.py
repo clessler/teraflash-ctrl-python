@@ -535,6 +535,10 @@ class TeraFlash:
             state: True for ON, False for OFF
         """
         if state:
+            # the device answers a repeat ON with NOT APPLICABLE, which wedges the config thread
+            if self.laser:
+                logging.warning("[CMD] laser is already on, ignoring request")
+                return
             logging.debug("[CMD] setting laser on")
             cmd = (b'\x0a', "LASER : ON")
         else:
@@ -559,6 +563,10 @@ class TeraFlash:
             logging.info(f"emitter {emitter} is invalid, please use 1 or 2 as emitter value")
             return
         if state:
+            # same as set_laser: a repeat ON gets NOT APPLICABLE
+            if self.emitter[emitter - 1]:
+                logging.warning(f"[CMD] emitter {emitter} is already on, ignoring request")
+                return
             # laser must be running before we turn on the emitter bias
             if not self.laser:
                 self.set_laser(True)
