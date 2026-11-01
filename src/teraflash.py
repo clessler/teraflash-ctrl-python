@@ -44,6 +44,10 @@ class TeraFlashCommandTimeout(RuntimeError):
     """Raised when the device does not acknowledge a command in time."""
 
 
+class TeraFlashConnectionLost(TeraFlashCommandTimeout):
+    """Raised when the control connection is gone (the device turns the laser off on its own)."""
+
+
 class TeraFlash:
 
     def __init__(self,
@@ -183,11 +187,45 @@ class TeraFlash:
                 self.config_thread.join()
             logging.debug("[EXIT] disconnected from device")
 
+    def is_connected(self) -> bool:
+        """
+            the config thread returns when the device drops the control connection
+        """
+        return self.config_thread.is_alive()
+
     def _wait_for_ack(self, timeout: float = CMD_ACK_TIMEOUT) -> None:
-        if not self.cmd_ack.wait(timeout=timeout):
-            logging.error(f"[CMD] device did not acknowledge command within {timeout}s")
-            raise TeraFlashCommandTimeout(f"no cmd_ack within {timeout}s")
+        # poll in slices so a dropped connection fails at once instead of after the full timeout
+        deadline = time.monotonic() + timeout
+        while not self.cmd_ack.wait(timeout=0.5):
+            if not self.is_connected():
+                logging.error("[CMD] the control connection to the device is closed")
+                raise TeraFlashConnectionLost("the control connection to the device is closed")
+            if time.monotonic() > deadline:
+                logging.error(f"[CMD] device did not acknowledge command within {timeout}s")
+                raise TeraFlashCommandTimeout(f"no cmd_ack within {timeout}s")
         self.cmd_ack.clear()
+
+    def resync(self, timeout: float = ACQ_TIMEOUT) -> bool:
+        """
+            waits until no command is queued or in flight and no buffer flush is pending,
+            then clears the handshake events, so a late answer to an aborted command
+            (Ctrl+C, timeout) can't be taken as the answer to the next one
+        Args:
+            timeout: maximum time (s) to wait for the driver to go idle
+        Returns: True if the driver went idle within the timeout
+        """
+        deadline = time.monotonic() + timeout
+        idle_polls = 0
+        # two idle polls in a row: a command just taken off the queue may not be marked busy yet
+        while idle_polls < 2 and self.is_connected() and time.monotonic() < deadline:
+            if self.cmd_queue.empty() and not self.socket.busy and not self.range_changed.is_set():
+                idle_polls += 1
+            else:
+                idle_polls = 0
+            time.sleep(0.05)
+        self.cmd_ack.clear()
+        self.buffer_emptied.clear()
+        return idle_polls >= 2
 
     def _wait_for_buffer_emptied(self, timeout: float = BUFFER_EMPTY_TIMEOUT) -> None:
         if not self.buffer_emptied.wait(timeout=timeout):
@@ -267,10 +305,29 @@ class TeraFlash:
             them - see runner.py in fts_teraflash for that approach.
         """
         logging.debug("[CMD] disconnecting from device")
-        self.set_acq_stop()
-        self.set_emitter(1, False)
-        self.set_emitter(2, False)
-        self.set_laser(False)
+        # shutdown order: voice coil, bias, laser. try every step even if one fails: giving up
+        # would drop the connection with the bias and laser still on. the config thread sends
+        # the commands in queue order, so a timed-out step still goes out before the next one
+        steps = [("stop voice coil", self.set_acq_stop),
+                 ("emitter 1 off", lambda: self._switch_emitter(1, False)),
+                 ("emitter 2 off", lambda: self._switch_emitter(2, False)),
+                 ("laser off", lambda: self._switch_laser(False))]
+        first_error = None
+        for name, step in steps:
+            try:
+                step()
+            except TeraFlashConnectionLost:
+                # nothing left to send to: the device turns the laser off on its own
+                logging.error(f"[EXIT] connection lost before '{name}', the device shuts itself down")
+                return
+            except Exception as e:
+                logging.error(f"[EXIT] shutdown step '{name}' failed: {e!r}")
+                if first_error is None:
+                    first_error = e
+        if first_error is not None:
+            # let any queued shutdown commands go out before the threads are stopped
+            self.resync()
+            raise first_error
 
     def get_sys_status(self):
         """
@@ -535,17 +592,25 @@ class TeraFlash:
             state: True for ON, False for OFF
         """
         if state:
-            # the device answers a repeat ON with NOT APPLICABLE, which wedges the config thread
+            # the device would answer a repeat ON with NOT APPLICABLE; don't send it at all
             if self.laser:
                 logging.warning("[CMD] laser is already on, ignoring request")
                 return
-            logging.debug("[CMD] setting laser on")
-            cmd = (b'\x0a', "LASER : ON")
         else:
-            # emitter bias must be turned off before we turn of the laser
+            # emitter bias must be turned off before we turn of the laser (this also stops the voice coil)
             if self.emitter:
                 self.set_emitter(1, False)
                 self.set_emitter(2, False)
+        self._switch_laser(state)
+
+    def _switch_laser(self, state: bool):
+        """
+            sends LASER : ON/OFF without the ordering checks of set_laser
+        """
+        if state:
+            logging.debug("[CMD] setting laser on")
+            cmd = (b'\x0a', "LASER : ON")
+        else:
             logging.debug("[CMD] setting laser off")
             cmd = (b'\x0b', "LASER : OFF")
         self.cmd_queue.put(cmd)
@@ -570,6 +635,16 @@ class TeraFlash:
             # laser must be running before we turn on the emitter bias
             if not self.laser:
                 self.set_laser(True)
+        elif self.acquisition:
+            # shutdown order is voice coil, bias, laser: stop the voice coil before the bias goes off
+            self.set_acq_stop()
+        self._switch_emitter(emitter, state)
+
+    def _switch_emitter(self, emitter: int, state: bool):
+        """
+            sends VOLTn : ON/OFF without the ordering checks of set_emitter
+        """
+        if state:
             logging.debug(f"[CMD] setting emitter {emitter} on")
             cmd = (b'\x0a', f"VOLT{emitter} : ON")
         else:
@@ -583,6 +658,10 @@ class TeraFlash:
         """
             start the acquisition (data streaming)
         """
+        # start-up order is laser, bias, voice coil: refuse before anything is sent
+        if not (self.laser and any(self.emitter)):
+            raise RuntimeError("set_acq_start() needs the laser and an emitter bias on first: "
+                               "call set_laser(True) and set_emitter(1, True)")
         logging.debug("[CMD] starting acquisition")
         cmd = (b'\x13', "ACQUISITION : START")
         self.cmd_queue.put(cmd)

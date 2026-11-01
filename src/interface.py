@@ -126,6 +126,9 @@ class TopticaSocket:
         self.data_header_len = 7
 
         self.avg_countdown = 0
+        # True from taking a command off the queue until its answer is handled,
+        # so TeraFlash.resync() can wait out a command still in flight
+        self.busy = False
 
         self.config_server_address = (ip, 6341)
         self.data_server_address = (ip, 6342)
@@ -192,6 +195,13 @@ class TopticaSocket:
             logging.debug(f"[TCP CONF] sending: {(length_byte, c)}")
         return self.send_header + length_byte + payload
 
+    def _ack(self):
+        """
+            signals the waiting caller that the current command was answered
+        """
+        self.cmd_ack.set()
+        self.busy = False
+
     def wait_for_answer(self, client: socket, length: int = 1024):
         """
             waits for the device to acknowledge the previously sent command
@@ -215,6 +225,12 @@ class TopticaSocket:
                     logging.debug(f"[TCP CONF] received: {_data_decoded}")
                     return True
                 elif "MON" in _data_decoded:
+                    return True
+                elif "NOT APPLICABLE" in _data_decoded:
+                    # the command had nothing to do (e.g. LASER : ON while already on). treat it
+                    # as the answer: waiting for an OK that never comes stops the heartbeat, and
+                    # the device then drops the connection, which turns the laser off
+                    logging.warning(f"[TCP CONF] received: {_data_decoded} (command had no effect, continuing)")
                     return True
                 logging.debug(f"[TCP CONF] received: {_data_decoded}")
             else:
@@ -256,16 +272,18 @@ class TopticaSocket:
                         # check the queue for commands
                         try:
                             cmd = cmd_queue.get(block=False)
+                            self.busy = True
                             (b, c) = cmd
                             message = self._frame_command(cmd)
                             if message is None:
+                                self.busy = False
                                 continue
                             # send command
                             client.send(message)
                             if c == "SYSTEM : TELL STATUS":
                                 # if we request the status, save the response
                                 status = client.recv(2048)[self.read_header_len:].decode("utf-8", "ignore")
-                                self.cmd_ack.set()
+                                self._ack()
                             elif "RANGE" in c:
                                 # if we change the range, also change it for the data thread
                                 parts = c.split(" ")
@@ -274,7 +292,7 @@ class TopticaSocket:
                                 # wait for acknowledge
                                 if not self.wait_for_answer(client):
                                     return
-                                self.cmd_ack.set()
+                                self._ack()
                             elif "BEGIN" in c:
                                 # if we change the range, also change it for the data thread
                                 parts = c.split(" ")
@@ -283,12 +301,12 @@ class TopticaSocket:
                                 # wait for acknowledge
                                 if not self.wait_for_answer(client):
                                     return
-                                self.cmd_ack.set()
+                                self._ack()
                             else:
                                 # wait for acknowledge
                                 if not self.wait_for_answer(client):
                                     return
-                                self.cmd_ack.set()
+                                self._ack()
                         except Empty:
                             # just to a simple heartbeat
                             message = self._frame_command((b'\x12', "SYSTEM : MONITOR 1"), log=False)
@@ -301,6 +319,8 @@ class TopticaSocket:
                         # the socket timeout - loop back so `running` gets
                         # re-checked instead of this thread hanging forever
                         logging.debug("[TCP CONF] recv/send timed out this cycle, retrying")
+                        # a command caught here is never acked (its caller times out), so it is no longer in flight
+                        self.busy = False
                         continue
                     time.sleep(0.25)
             finally:
